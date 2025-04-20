@@ -2,31 +2,34 @@ package utils
 
 import (
 	"errors"
-
-	"crypto/rand"
-	"encoding/hex"
+	"math/rand"
+	"time"
 )
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
 
 // GenerateID returns a 16-byte hex string ID (UUID-like)
 func GenerateID() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return "" // or panic/log
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, 8)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
 	}
-	return hex.EncodeToString(b)
+	return string(b)
 }
 
 var (
 	ErrInvalidTransition = errors.New("invalid status transition")
 )
 
-// ValidTransition checks if the status transition is valid
-func ValidTransition(current, next string) bool {
-	switch current {
+func ValidTransition(currentStatus, newStatus string) bool {
+	switch currentStatus {
 	case "Queued":
-		return next == "Running" || next == "Cancelled"
+		return newStatus == "Running" || newStatus == "Cancelled"
 	case "Running":
-		return next == "Done" || next == "Cancelled"
+		return newStatus == "Done" || newStatus == "Cancelled" || newStatus == "Failed"
 	default:
 		return false
 	}

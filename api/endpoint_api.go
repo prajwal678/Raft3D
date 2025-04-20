@@ -1,40 +1,74 @@
-package handlers
+package api
 
 import (
 	"encoding/json"
 	"net/http"
+
 	"raft3d/models"
 	"raft3d/store"
-	"raft3d/utils"
 )
 
-// Handler struct that includes reference to the in-memory store
 type Handler struct {
 	store *store.Store
 }
 
-// NewHandler returns a new Handler instance
 func NewHandler(s *store.Store) *Handler {
-	return &Handler{store: s}
+	return &Handler{
+		store: s,
+	}
+}
+
+func (h *Handler) HandleNotLeader(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusTemporaryRedirect)
+
+	leader := h.store.GetLeader()
+	response := map[string]string{
+		"error":  "not the leader",
+		"leader": leader,
+	}
+	json.NewEncoder(w).Encode(response)
 }
 
 // CreatePrinter handles POST /api/v1/printers
 func (h *Handler) CreatePrinter(w http.ResponseWriter, r *http.Request) {
-	var printer models.Printer
-	if err := json.NewDecoder(r.Body).Decode(&printer); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	h.store.AddPrinter(printer)
+	var printer models.Printer
+	err := json.NewDecoder(r.Body).Decode(&printer)
+	if err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
 
-	w.Header().Set("Content-Type", "application/json")
+	if printer.ID == "" {
+		http.Error(w, "printer id is required", http.StatusBadRequest)
+		return
+	}
+
+	err = h.store.AddPrinter(printer)
+	if err != nil {
+		if err.Error() == "not the leader" {
+			http.Error(w, "not the leader", http.StatusPreconditionFailed)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(printer)
 }
 
 // GetPrinters handles GET /api/v1/printers
 func (h *Handler) GetPrinters(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	printers := h.store.GetPrinters()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -43,21 +77,43 @@ func (h *Handler) GetPrinters(w http.ResponseWriter, r *http.Request) {
 
 // CreateFilament handles POST /api/v1/filaments
 func (h *Handler) CreateFilament(w http.ResponseWriter, r *http.Request) {
-	var filament models.Filament
-	if err := json.NewDecoder(r.Body).Decode(&filament); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	h.store.AddFilament(filament)
+	var filament models.Filament
+	err := json.NewDecoder(r.Body).Decode(&filament)
+	if err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
 
-	w.Header().Set("Content-Type", "application/json")
+	if filament.ID == "" {
+		http.Error(w, "filament id is required", http.StatusBadRequest)
+		return
+	}
+
+	err = h.store.AddFilament(filament)
+	if err != nil {
+		if err.Error() == "not the leader" {
+			http.Error(w, "not the leader", http.StatusPreconditionFailed)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(filament)
 }
 
 // GetFilaments handles GET /api/v1/filaments
 func (h *Handler) GetFilaments(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	filaments := h.store.GetFilaments()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -66,48 +122,53 @@ func (h *Handler) GetFilaments(w http.ResponseWriter, r *http.Request) {
 
 // CreatePrintJob handles POST /api/v1/print_jobs
 func (h *Handler) CreatePrintJob(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	var printJob models.PrintJob
-	if err := json.NewDecoder(r.Body).Decode(&printJob); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+	err := json.NewDecoder(r.Body).Decode(&printJob)
+	if err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	// Validate the printer and filament existence
-	_, printerExists := h.store.Printers[printJob.PrinterID]
-	if !printerExists {
-		http.Error(w, "Printer not found", http.StatusBadRequest)
+	if printJob.ID == "" {
+		http.Error(w, "print job id is required", http.StatusBadRequest)
 		return
 	}
 
-	filament, filamentExists := h.store.Filaments[printJob.FilamentID]
-	if !filamentExists {
-		http.Error(w, "Filament not found", http.StatusBadRequest)
+	if printJob.PrinterID == "" {
+		http.Error(w, "printer id is required", http.StatusBadRequest)
 		return
 	}
 
-	// Check filament availability
-	remainingWeight := filament.RemainingWeightInGrams
-	for _, job := range h.store.PrintJobs {
-		if job.FilamentID == printJob.FilamentID && job.Status == "Queued" {
-			remainingWeight -= job.PrintWeightInGrams
+	if printJob.FilamentID == "" {
+		http.Error(w, "filament id is required", http.StatusBadRequest)
+		return
+	}
+
+	err = h.store.AddPrintJob(printJob)
+	if err != nil {
+		if err.Error() == "not the leader" {
+			http.Error(w, "not the leader", http.StatusPreconditionFailed)
+			return
 		}
-	}
-
-	if printJob.PrintWeightInGrams > remainingWeight {
-		http.Error(w, "Not enough filament remaining", http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Add the print job to the store
-	h.store.AddPrintJob(printJob)
-
-	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(printJob)
 }
 
 // GetPrintJobs handles GET /api/v1/print_jobs
 func (h *Handler) GetPrintJobs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	printJobs := h.store.GetPrintJobs()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -115,33 +176,21 @@ func (h *Handler) GetPrintJobs(w http.ResponseWriter, r *http.Request) {
 }
 
 // UpdatePrintJobStatus handles POST /api/v1/print_jobs/{id}/status
-func (h *Handler) UpdatePrintJobStatus(w http.ResponseWriter, r *http.Request, jobID string, newStatus string) {
-	job, exists := h.store.PrintJobs[jobID]
-	if !exists {
-		http.Error(w, "Print job not found", http.StatusNotFound)
+func (h *Handler) UpdatePrintJobStatus(w http.ResponseWriter, r *http.Request, jobID, status string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	if !utils.ValidTransition(job.Status, newStatus) {
-		http.Error(w, "Invalid status transition", http.StatusBadRequest)
-		return
-	}
-
-	// Perform transition
-	if newStatus == "Done" {
-		filament, ok := h.store.Filaments[job.FilamentID]
-		if !ok {
-			http.Error(w, "Associated filament not found", http.StatusInternalServerError)
+	err := h.store.UpdatePrintJobStatus(jobID, status)
+	if err != nil {
+		if err.Error() == "not the leader" {
+			http.Error(w, "not the leader", http.StatusPreconditionFailed)
 			return
 		}
-		// Reduce filament weight
-		filament.RemainingWeightInGrams -= job.PrintWeightInGrams
-		h.store.Filaments[job.FilamentID] = filament
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
-	job.Status = newStatus
-	h.store.PrintJobs[jobID] = job
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(job)
+	w.WriteHeader(http.StatusOK)
 }

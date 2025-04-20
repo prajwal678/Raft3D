@@ -5,13 +5,14 @@ import (
 	"sync"
 
 	"raft3d/models"
+	"raft3d/raftnode"
 )
 
+var ErrNotLeader = errors.New("not the leader")
+
 type Store struct {
-	Printers  map[string]models.Printer
-	Filaments map[string]models.Filament
-	PrintJobs map[string]models.PrintJob
-	mu        sync.RWMutex
+	raftNode *raftnode.RaftNode
+	mu       sync.RWMutex
 }
 
 var (
@@ -20,77 +21,89 @@ var (
 	ErrJobNotFound      = errors.New("print job not found")
 )
 
-func NewStore() *Store {
+func NewStore(node *raftnode.RaftNode) *Store {
 	return &Store{
-		Printers:  make(map[string]models.Printer),
-		Filaments: make(map[string]models.Filament),
-		PrintJobs: make(map[string]models.PrintJob),
+		raftNode: node,
 	}
 }
 
-// AddPrinter adds a new printer to the store
-func (s *Store) AddPrinter(printer models.Printer) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.Printers[printer.ID] = printer
+func (s *Store) AddPrinter(printer models.Printer) error {
+	if err := s.raftNode.AddPrinter(printer); err != nil {
+		return err
+	}
+	return nil
 }
 
-// GetPrinters returns all printers
-func (s *Store) GetPrinters() []models.Printer {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	printers := make([]models.Printer, 0, len(s.Printers))
-	for _, p := range s.Printers {
-		printers = append(printers, p)
-	}
+func (s *Store) GetPrinters() map[string]models.Printer {
+	printers, _, _ := s.raftNode.GetState()
 	return printers
 }
 
-// AddFilament adds a new filament to the store
-func (s *Store) AddFilament(filament models.Filament) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.Filaments[filament.ID] = filament
+func (s *Store) GetPrinter(id string) (models.Printer, bool) {
+	printers, _, _ := s.raftNode.GetState()
+	printer, ok := printers[id]
+	return printer, ok
 }
 
-// GetFilaments returns all filaments
-func (s *Store) GetFilaments() []models.Filament {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	filaments := make([]models.Filament, 0, len(s.Filaments))
-	for _, f := range s.Filaments {
-		filaments = append(filaments, f)
+func (s *Store) AddFilament(filament models.Filament) error {
+	if err := s.raftNode.AddFilament(filament); err != nil {
+		return err
 	}
+	return nil
+}
+
+func (s *Store) GetFilaments() map[string]models.Filament {
+	_, filaments, _ := s.raftNode.GetState()
 	return filaments
 }
 
-// AddPrintJob adds a new print job to the store
-func (s *Store) AddPrintJob(job models.PrintJob) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.PrintJobs[job.ID] = job
+func (s *Store) GetFilament(id string) (models.Filament, bool) {
+	_, filaments, _ := s.raftNode.GetState()
+	filament, ok := filaments[id]
+	return filament, ok
 }
 
-// GetPrintJobs returns all print jobs
-func (s *Store) GetPrintJobs() []models.PrintJob {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	jobs := make([]models.PrintJob, 0, len(s.PrintJobs))
-	for _, j := range s.PrintJobs {
-		jobs = append(jobs, j)
+func (s *Store) AddPrintJob(job models.PrintJob) error {
+	if err := s.raftNode.AddPrintJob(job); err != nil {
+		return err
 	}
-	return jobs
-}
-
-// UpdatePrintJobStatus updates the status of a print job
-func (s *Store) UpdatePrintJobStatus(jobID, status string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	job, exists := s.PrintJobs[jobID]
-	if !exists {
-		return ErrJobNotFound
-	}
-	job.Status = status
-	s.PrintJobs[jobID] = job
 	return nil
+}
+
+func (s *Store) GetPrintJobs() map[string]models.PrintJob {
+	_, _, printJobs := s.raftNode.GetState()
+	return printJobs
+}
+
+func (s *Store) GetPrintJob(id string) (models.PrintJob, bool) {
+	_, _, printJobs := s.raftNode.GetState()
+	job, ok := printJobs[id]
+	return job, ok
+}
+
+func (s *Store) UpdatePrintJobStatus(id, status string) error {
+	if err := s.raftNode.UpdatePrintJobStatus(id, status); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) IsLeader() bool {
+	return s.raftNode.IsLeader()
+}
+
+func (s *Store) GetLeader() string {
+	return s.raftNode.GetLeader()
+}
+
+func (s *Store) AddServer(id, addr string) error {
+	return s.raftNode.AddServer(id, addr)
+}
+
+func (s *Store) RemoveServer(id string) error {
+	return s.raftNode.RemoveServer(id)
+}
+
+func (s *Store) GetClusterStats() map[string]interface{} {
+	return s.raftNode.GetNodeStats()
 }
