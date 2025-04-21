@@ -1,24 +1,37 @@
 package raftnode
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"raft3d/fsm"
 	"raft3d/models"
+	"raft3d/utils"
 
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb"
 )
+
+// FailureDetector is a map that tracks server failure counts
+type FailureDetector map[string]int
+
+// NewFailureDetector creates a new failure detector with given capacity
+func NewFailureDetector(capacity int) *FailureDetector {
+	fd := make(FailureDetector, capacity)
+	return &fd
+}
 
 // ServerStats contains statistics for a server in the cluster
 type ServerStats struct {
@@ -31,18 +44,25 @@ type ServerStats struct {
 }
 
 type RaftNode struct {
-	nodeID      string
-	raftAddr    string
-	dataDir     string
-	bootstrap   bool
-	raft        *raft.Raft
-	fsm         *fsm.PrinterFSM
-	logStore    raft.LogStore
-	stableStore raft.StableStore
-	transport   raft.Transport
+	nodeID          string
+	raftAddr        string
+	dataDir         string
+	bootstrap       bool
+	raft            *raft.Raft
+	fsm             *fsm.PrinterFSM
+	transport       raft.Transport
+	logStore        raft.LogStore
+	stableStore     raft.StableStore
+	snapshotStore   raft.SnapshotStore
+	joinedServers   map[string]string // map of server id to raft address
+	mu              sync.Mutex
+	failureDetector *FailureDetector
+	previousLeader  string
+	leaderLostTime  time.Time
+	leaderless      bool // track if there's no leader
+	logger          *utils.Logger
 
-	failureDetector  map[string]int // Tracks failed contact attempts
-	failureThreshold int            // Number of failures before removing a server
+	failureThreshold int // Number of failures before removing a server
 	monitorShutdown  chan struct{}
 	lastContactTimes map[string]time.Time
 	joinTimes        map[string]time.Time
@@ -55,123 +75,157 @@ type RaftNode struct {
 	appliedCommands int64
 }
 
-func NewRaftNode(nodeID, raftAddr, dataDir string, bootstrap bool) (*RaftNode, error) {
-	printerFSM := fsm.NewPrinterFSM()
-
-	// boltDB suppressed warnings cuz annoying af
-	oldLogOutput := log.Writer()
-	log.SetOutput(ioutil.Discard)
-
-	logStorePath := filepath.Join(dataDir, "raft.db")
-	boltDB, err := raftboltdb.NewBoltStore(logStorePath)
-
-	// restore normal logging
-	log.SetOutput(oldLogOutput)
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to create bolt store: %w", err)
+func NewRaftNode(nodeID, raftAddr, dataDir string, bootstrap bool, joinAddr string) (*RaftNode, error) {
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, fmt.Errorf("error creating data directory: %w", err)
 	}
 
-	logStore := boltDB
-	stableStore := boltDB
+	// Create a logger for this node
+	logger, err := utils.NewLogger(nodeID, "logs", utils.LevelInfo, utils.LevelDebug)
+	if err != nil {
+		return nil, fmt.Errorf("error creating logger: %w", err)
+	}
 
-	// Create snapshot store
+	// Create the FSM
+	rn := &RaftNode{
+		nodeID:        nodeID,
+		raftAddr:      raftAddr,
+		dataDir:       dataDir,
+		bootstrap:     bootstrap,
+		joinedServers: make(map[string]string),
+		logger:        logger,
+	}
+
+	fsm := fsm.NewPrinterFSM()
+	rn.fsm = fsm
+
+	// Create the log store and stable store
+	boltDB, err := raftboltdb.NewBoltStore(filepath.Join(dataDir, "raft.db"))
+	if err != nil {
+		return nil, fmt.Errorf("error creating BoltDB log store: %w", err)
+	}
+	rn.logStore = boltDB
+	rn.stableStore = boltDB
+
+	// Create the snapshot store
 	snapshotStore, err := raft.NewFileSnapshotStore(dataDir, 3, os.Stderr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create snapshot store: %w", err)
+		return nil, fmt.Errorf("error creating snapshot store: %w", err)
 	}
+	rn.snapshotStore = snapshotStore
 
-	// Create transport
-	tcpAddr, err := net.ResolveTCPAddr("tcp", raftAddr)
+	// Setup the transport
+	addr, err := net.ResolveTCPAddr("tcp", raftAddr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve tcp address: %w", err)
+		return nil, fmt.Errorf("error resolving TCP address: %w", err)
 	}
-
-	transport, err := raft.NewTCPTransport(raftAddr, tcpAddr, 3, 10*time.Second, os.Stderr)
+	transport, err := raft.NewTCPTransport(raftAddr, addr, 3, 10*time.Second, os.Stderr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create tcp transport: %w", err)
+		return nil, fmt.Errorf("error creating TCP transport: %w", err)
 	}
+	rn.transport = transport
 
-	// Create Raft config
+	// Create a failure detector
+	rn.failureDetector = NewFailureDetector(5)
+
+	// Setup Raft configuration
 	config := raft.DefaultConfig()
 	config.LocalID = raft.ServerID(nodeID)
+	// Tune timeouts for better election stability and reduced loss of leadership
+	config.HeartbeatTimeout = 500 * time.Millisecond   // Faster heartbeats to detect failure quicker
+	config.ElectionTimeout = 1000 * time.Millisecond   // Faster elections
+	config.CommitTimeout = 100 * time.Millisecond      // Faster commits
+	config.SnapshotInterval = 24 * time.Hour           // Longer snapshot interval as we don't need frequent snapshots
+	config.SnapshotThreshold = 10240                   // Increase snapshot threshold
+	config.LeaderLeaseTimeout = 500 * time.Millisecond // Must be <= HeartbeatTimeout
 
-	// Tune Raft parameters for better election stability
-	config.HeartbeatTimeout = 1500 * time.Millisecond   // Increase heartbeat timeout (default: 500-1000ms)
-	config.ElectionTimeout = 2000 * time.Millisecond    // Increase election timeout (default: 1000-2000ms)
-	config.CommitTimeout = 200 * time.Millisecond       // Time to compact and commit logs
-	config.SnapshotInterval = 120 * time.Second         // More frequent snapshots
-	config.SnapshotThreshold = 1024                     // Smaller threshold for more frequent snapshots
-	config.LeaderLeaseTimeout = 1000 * time.Millisecond // Must be less than heartbeat timeout
+	// Configure logging - suppress most Raft logs
+	config.LogOutput = io.Discard
 
-	config.TrailingLogs = 10240  // more logs
-	config.MaxAppendEntries = 64 // small batches for stability
-
-	r, err := raft.NewRaft(config, printerFSM, logStore, stableStore, snapshotStore, transport)
+	// Create the Raft instance
+	r, err := raft.NewRaft(config, rn.fsm, rn.logStore, rn.stableStore, rn.snapshotStore, rn.transport)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create raft node: %w", err)
+		return nil, fmt.Errorf("error creating Raft: %w", err)
 	}
+	rn.raft = r
 
-	node := &RaftNode{
-		nodeID:           nodeID,
-		raftAddr:         raftAddr,
-		dataDir:          dataDir,
-		bootstrap:        bootstrap,
-		raft:             r,
-		fsm:              printerFSM,
-		logStore:         logStore,
-		stableStore:      stableStore,
-		transport:        transport,
-		failureDetector:  make(map[string]int),
-		failureThreshold: 20,
-		monitorShutdown:  make(chan struct{}),
-		lastContactTimes: make(map[string]time.Time),
-		joinTimes:        make(map[string]time.Time),
-		stats:            make(map[string]*ServerStats),
-		termTransitions:  0,
-	}
-
-	go node.monitorLeadership()
-	go node.monitorServerHealth()
-	go node.collectStats()
-
+	// Bootstrap the cluster if needed
 	if bootstrap {
-		log.Println("bootstrapping raft cluster")
-
-		cfg := r.GetConfiguration()
-		if err := cfg.Error(); err != nil {
-			return nil, fmt.Errorf("failed to get raft configuration: %w", err)
-		}
-
-		if len(cfg.Configuration().Servers) == 0 {
-			configuration := raft.Configuration{
-				Servers: []raft.Server{
-					{
-						ID:       raft.ServerID(nodeID),
-						Address:  raft.ServerAddress(raftAddr),
-						Suffrage: raft.Voter,
-					},
+		rn.logger.Info("bootstrapping cluster with node: %s", nodeID)
+		configuration := raft.Configuration{
+			Servers: []raft.Server{
+				{
+					ID:       raft.ServerID(nodeID),
+					Address:  raft.ServerAddress(raftAddr),
+					Suffrage: raft.Voter,
 				},
-			}
-
-			f := r.BootstrapCluster(configuration)
-			if err := f.Error(); err != nil {
-				return nil, fmt.Errorf("failed to bootstrap cluster: %w", err)
-			}
-		} else {
-			log.Println("node already bootstrapped, skipping")
+			},
+		}
+		rn.raft.BootstrapCluster(configuration)
+	} else if joinAddr != "" {
+		// Join an existing cluster
+		rn.logger.Info("joining existing cluster at %s", joinAddr)
+		err = rn.joinCluster(joinAddr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to join cluster: %w", err)
 		}
 	}
 
-	node.statsMutex.Lock()
-	node.stats[nodeID] = &ServerStats{
+	// Start monitoring leadership
+	go rn.monitorLeadership()
+
+	rn.failureThreshold = 20
+	rn.monitorShutdown = make(chan struct{})
+	rn.lastContactTimes = make(map[string]time.Time)
+	rn.joinTimes = make(map[string]time.Time)
+	rn.stats = make(map[string]*ServerStats)
+	rn.termTransitions = 0
+	rn.appliedCommands = 0
+
+	go rn.collectStats()
+
+	rn.statsMutex.Lock()
+	rn.stats[nodeID] = &ServerStats{
 		JoinTime: time.Now(),
 		Address:  raftAddr,
-		State:    node.getStateString(),
+		State:    rn.getStateString(),
 	}
-	node.statsMutex.Unlock()
+	rn.statsMutex.Unlock()
 
-	return node, nil
+	return rn, nil
+}
+
+// joinCluster sends a request to join an existing Raft cluster
+func (rn *RaftNode) joinCluster(joinAddr string) error {
+	// Ensure the address has http:// prefix
+	if !strings.HasPrefix(joinAddr, "http://") {
+		joinAddr = "http://" + joinAddr
+	}
+
+	joinURL := fmt.Sprintf("%s/join", joinAddr)
+
+	// Prepare the join request
+	reqBody, err := json.Marshal(map[string]string{
+		"node_id": rn.nodeID,
+		"addr":    rn.raftAddr,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal join request: %w", err)
+	}
+
+	// Send the join request
+	resp, err := http.Post(joinURL, "application/json", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return fmt.Errorf("failed to join cluster: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to join cluster: %s", string(body))
+	}
+
+	return nil
 }
 
 func (n *RaftNode) AddServer(nodeID, raftAddr string) error {
@@ -249,12 +303,13 @@ func (n *RaftNode) Shutdown() error {
 		return err
 	}
 
-	if t, ok := n.transport.(*raft.NetworkTransport); ok {
-		t.Close()
+	// Close transport if possible
+	if tcpTransport, ok := n.transport.(*raft.NetworkTransport); ok {
+		tcpTransport.Close()
 	}
 
-	if bs, ok := n.logStore.(*raftboltdb.BoltStore); ok {
-		if err := bs.Close(); err != nil {
+	if logStore, ok := n.logStore.(io.Closer); ok {
+		if err := logStore.Close(); err != nil {
 			log.Printf("error closing boltdb store: %v", err)
 		}
 	}
@@ -285,22 +340,8 @@ func (n *RaftNode) AddPrinter(printer models.Printer) error {
 		return err
 	}
 
-	f := n.raft.Apply(cmdData, 30*time.Second)
-	if err := f.Error(); err != nil {
-		return err
-	}
-
-	if resp := f.Response(); resp != nil {
-		if err, ok := resp.(error); ok {
-			return err
-		}
-	}
-
-	n.statsMutex.Lock()
-	n.appliedCommands++
-	n.statsMutex.Unlock()
-
-	return nil
+	future := n.raft.Apply(cmdData, 10*time.Second)
+	return future.Error()
 }
 
 func (n *RaftNode) AddFilament(filament models.Filament) error {
@@ -323,22 +364,8 @@ func (n *RaftNode) AddFilament(filament models.Filament) error {
 		return err
 	}
 
-	f := n.raft.Apply(cmdData, 30*time.Second)
-	if err := f.Error(); err != nil {
-		return err
-	}
-
-	if resp := f.Response(); resp != nil {
-		if err, ok := resp.(error); ok {
-			return err
-		}
-	}
-
-	n.statsMutex.Lock()
-	n.appliedCommands++
-	n.statsMutex.Unlock()
-
-	return nil
+	future := n.raft.Apply(cmdData, 10*time.Second)
+	return future.Error()
 }
 
 func (n *RaftNode) AddPrintJob(job models.PrintJob) error {
@@ -361,22 +388,8 @@ func (n *RaftNode) AddPrintJob(job models.PrintJob) error {
 		return err
 	}
 
-	f := n.raft.Apply(cmdData, 30*time.Second)
-	if err := f.Error(); err != nil {
-		return err
-	}
-
-	if resp := f.Response(); resp != nil {
-		if err, ok := resp.(error); ok {
-			return err
-		}
-	}
-
-	n.statsMutex.Lock()
-	n.appliedCommands++
-	n.statsMutex.Unlock()
-
-	return nil
+	future := n.raft.Apply(cmdData, 10*time.Second)
+	return future.Error()
 }
 
 func (n *RaftNode) UpdatePrintJobStatus(jobID, status string) error {
@@ -395,22 +408,8 @@ func (n *RaftNode) UpdatePrintJobStatus(jobID, status string) error {
 		return err
 	}
 
-	f := n.raft.Apply(cmdData, 30*time.Second)
-	if err := f.Error(); err != nil {
-		return err
-	}
-
-	if resp := f.Response(); resp != nil {
-		if err, ok := resp.(error); ok {
-			return err
-		}
-	}
-
-	n.statsMutex.Lock()
-	n.appliedCommands++
-	n.statsMutex.Unlock()
-
-	return nil
+	future := n.raft.Apply(cmdData, 10*time.Second)
+	return future.Error()
 }
 
 func (n *RaftNode) RemoveServer(nodeID string) error {
@@ -418,14 +417,19 @@ func (n *RaftNode) RemoveServer(nodeID string) error {
 		return errors.New("not the leader")
 	}
 
-	log.Printf("removing server %s from the cluster configuration", nodeID)
 	future := n.raft.RemoveServer(raft.ServerID(nodeID), 0, 0)
 	if err := future.Error(); err != nil {
-		return fmt.Errorf("error removing server: %w", err)
+		return err
 	}
 
-	delete(n.failureDetector, nodeID)
-	delete(n.lastContactTimes, nodeID)
+	// Remove the server from our tracking
+	delete(n.joinTimes, nodeID)
+
+	// Safely dereference the failureDetector before deleting an entry
+	if n.failureDetector != nil {
+		fd := *n.failureDetector
+		delete(fd, nodeID)
+	}
 
 	n.statsMutex.Lock()
 	delete(n.stats, nodeID)
@@ -526,7 +530,11 @@ func (n *RaftNode) checkServers() {
 			n.handleFailedServer(serverID)
 		} else {
 			// Reset failure counter if we've had recent contact
-			n.failureDetector[serverID] = 0
+			// Safely dereference the failureDetector
+			if n.failureDetector != nil {
+				fd := *n.failureDetector
+				fd[serverID] = 0
+			}
 
 			// Update failure count in stats
 			n.statsMutex.Lock()
@@ -544,74 +552,96 @@ func (n *RaftNode) handleFailedServer(serverID string) {
 	joinTime, exists := n.joinTimes[serverID]
 	if exists && time.Since(joinTime) < 2*time.Minute {
 		// Give new nodes a grace period
-		log.Printf("server %s joined recently, giving it time to initialize", serverID)
+		n.logger.Info("server %s joined recently, giving it time to initialize", serverID)
 		return
 	}
 
-	n.failureDetector[serverID]++
+	// Safely access and update the failureDetector map
+	var failures int
+	if n.failureDetector != nil {
+		fd := *n.failureDetector
+		fd[serverID]++
+		failures = fd[serverID]
 
-	// Update failure count in stats
-	n.statsMutex.Lock()
-	if s, exists := n.stats[serverID]; exists {
-		s.FailureCount = n.failureDetector[serverID]
+		// Update failure count in stats
+		n.statsMutex.Lock()
+		if s, exists := n.stats[serverID]; exists {
+			s.FailureCount = failures
+		}
+		n.statsMutex.Unlock()
 	}
-	n.statsMutex.Unlock()
 
-	failures := n.failureDetector[serverID]
 	if failures == 1 || failures%5 == 0 {
-		log.Printf("warning: server %s is unresponsive (%d/%d failed checks)",
+		n.logger.Warn("server %s is unresponsive (%d/%d failed checks)",
 			serverID, failures, n.failureThreshold)
 	}
 
 	// If we've reached the threshold, remove the server
 	if failures >= n.failureThreshold {
-		log.Printf("server %s has been unresponsive for too long, removing from configuration", serverID)
+		n.logger.Warn("server %s has been unresponsive for too long, removing from configuration", serverID)
 		if err := n.RemoveServer(serverID); err != nil {
-			log.Printf("error removing server %s: %v", serverID, err)
+			n.logger.Error("error removing server %s: %v", serverID, err)
 		} else {
-			log.Printf("successfully removed server %s from the cluster", serverID)
+			n.logger.Info("successfully removed server %s from the cluster", serverID)
 		}
 	}
 }
 
 // monitorLeadership monitors leadership changes
 func (n *RaftNode) monitorLeadership() {
+	observedLeader := ""
+	leaderlessTime := time.Time{}
+	sleepInterval := 500 * time.Millisecond // More responsive checking
+
 	for {
-		select {
-		case <-n.monitorShutdown:
-			return
-		default:
-			isLeader := n.raft.State() == raft.Leader
+		leaderAddr := n.GetLeader()
 
-			// Track leadership acquisition
-			n.statsMutex.Lock()
-			// If we're now leader and we weren't before (leaderSince is zero time)
-			if isLeader && n.leaderSince.IsZero() {
-				n.leaderSince = time.Now()
-				n.termTransitions++
-				log.Printf("node %s became leader", n.nodeID)
+		// If leader has changed, log it
+		if leaderAddr != observedLeader {
+			n.logger.Info("leader changed from '%s' to '%s'", observedLeader, leaderAddr)
+			n.previousLeader = observedLeader
+			observedLeader = leaderAddr
 
-				// Update our own state
-				if s, exists := n.stats[n.nodeID]; exists {
-					s.State = "leader"
-				}
-			} else if !isLeader && !n.leaderSince.IsZero() {
-				// We were leader but aren't anymore
-				leadershipDuration := time.Since(n.leaderSince)
-				n.totalLeaderTime += leadershipDuration
-				n.leaderSince = time.Time{} // Reset to zero time
-				log.Printf("node %s lost leadership after %v", n.nodeID, leadershipDuration)
-
-				// Update our own state
-				if s, exists := n.stats[n.nodeID]; exists {
-					s.State = n.getStateString()
+			// Reset leaderless tracking if we have a leader
+			if leaderAddr != "" {
+				leaderlessTime = time.Time{}
+				n.leaderless = false
+			} else {
+				// Start tracking leaderless time
+				if leaderlessTime.IsZero() {
+					leaderlessTime = time.Now()
+					n.leaderLostTime = leaderlessTime
+					n.leaderless = true
 				}
 			}
-			n.statsMutex.Unlock()
-
-			// Sleep to avoid tight loop
-			time.Sleep(1 * time.Second)
 		}
+
+		// If we've been leaderless for too long, try to trigger an election
+		if leaderAddr == "" && !leaderlessTime.IsZero() {
+			leaderlessDuration := time.Since(leaderlessTime)
+			if leaderlessDuration > 3*time.Second {
+				// Check if this node is eligible to be a candidate
+				state := n.raft.State()
+				if state != raft.Leader && state != raft.Candidate {
+					n.logger.Info("no leader detected for too long, checking server health")
+
+					// Get configuration to see server list
+					future := n.raft.GetConfiguration()
+					if err := future.Error(); err == nil {
+						// Request a leader check which might trigger an election
+						future := n.raft.VerifyLeader()
+						if err := future.Error(); err != nil {
+							n.logger.Warn("leader verification failed: %v", err)
+						}
+					}
+				}
+
+				// Only reset the timer if we've taken action, otherwise keep trying
+				leaderlessTime = time.Now()
+			}
+		}
+
+		time.Sleep(sleepInterval)
 	}
 }
 
@@ -637,20 +667,27 @@ func (n *RaftNode) collectStats() {
 	for {
 		select {
 		case <-ticker.C:
-			// Update our own stats
+			// Update state for this node
 			n.statsMutex.Lock()
-			if s, exists := n.stats[n.nodeID]; exists {
-				s.State = n.getStateString()
+			if stat, ok := n.stats[n.nodeID]; ok {
+				stat.State = n.getStateString()
 
-				// If we're currently leader, update leadership time
-				if n.raft.State() == raft.Leader && !n.leaderSince.IsZero() {
-					currentLeadershipTime := time.Since(n.leaderSince)
-					s.LeadershipTime = n.totalLeaderTime + currentLeadershipTime
+				// Update leadership time if we're the leader
+				if stat.State == "leader" {
+					if n.leaderSince.IsZero() {
+						n.leaderSince = time.Now()
+					}
+					stat.LeadershipTime = time.Since(n.leaderSince)
 				} else {
-					s.LeadershipTime = n.totalLeaderTime
+					// Reset leader since if we're not leader
+					if !n.leaderSince.IsZero() {
+						n.totalLeaderTime += time.Since(n.leaderSince)
+						n.leaderSince = time.Time{}
+					}
 				}
 			}
 			n.statsMutex.Unlock()
+
 		case <-n.monitorShutdown:
 			return
 		}
@@ -665,28 +702,20 @@ func (n *RaftNode) GetClusterStats() map[string]ServerStats {
 	for id, stats := range n.stats {
 		result[id] = *stats
 	}
-
 	return result
 }
 
 func (n *RaftNode) GetNodeStats() map[string]interface{} {
-	n.statsMutex.RLock()
-	defer n.statsMutex.RUnlock()
+	state := n.raft.State().String()
+	isLeader := (state == "Leader")
 
-	raftStats := n.raft.Stats()
-
-	result := map[string]interface{}{
+	return map[string]interface{}{
 		"node_id":           n.nodeID,
-		"state":             n.getStateString(),
+		"state":             state,
+		"is_leader":         isLeader,
+		"leader":            n.GetLeader(),
 		"term_transitions":  n.termTransitions,
 		"applied_commands":  n.appliedCommands,
 		"total_leader_time": n.totalLeaderTime.String(),
-		"raft_stats":        raftStats,
 	}
-
-	if n.raft.State() == raft.Leader && !n.leaderSince.IsZero() {
-		result["current_leadership_duration"] = time.Since(n.leaderSince).String()
-	}
-
-	return result
 }

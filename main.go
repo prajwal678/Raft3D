@@ -107,7 +107,7 @@ func main() {
 
 	// Create the Raft node
 	logger.Info("creating raft node with data directory: %s", nodeDataDir)
-	raftNode, err := raftnode.NewRaftNode(*nodeID, *raftAddr, nodeDataDir, *bootstrap)
+	raftNode, err := raftnode.NewRaftNode(*nodeID, *raftAddr, nodeDataDir, *bootstrap, *join)
 	if err != nil {
 		logger.Error("failed to create raft node: %v", err)
 		os.Exit(1)

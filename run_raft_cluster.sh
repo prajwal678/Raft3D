@@ -58,25 +58,71 @@ tmux send-keys -t "$SESSION_NAME:0.0" "$bootstrap_cmd" C-m
 echo "Waiting for bootstrap node to start..."
 sleep "$DELAY_BETWEEN_NODES"
 
+# Make sure bootstrap node is running and leader before adding followers
+echo "Checking bootstrap node status..."
+max_attempts=10
+for i in $(seq 1 $max_attempts); do
+  echo "Attempt $i/$max_attempts..."
+  status=$(curl -s http://localhost:8080/cluster/status 2>/dev/null)
+  if [ $? -eq 0 ] && [ -n "$status" ]; then
+    is_leader=$(echo "$status" | grep -o '"is_leader":true' || echo "")
+    if [ -n "$is_leader" ]; then
+      echo "Bootstrap node is running and is the leader."
+      break
+    fi
+  fi
+  
+  if [ $i -eq $max_attempts ]; then
+    echo -e "${YELLOW}Warning: Bootstrap node may not be running as leader yet, but proceeding anyway.${NC}"
+  else
+    echo "Bootstrap node not ready yet, waiting..."
+    sleep 2
+  fi
+done
+
 for i in {1..3}; do
   echo -e "${YELLOW}Starting follower node $((i+1))...${NC}"
   IFS=':' read -r id http_port raft_port <<< "${nodes[$i]}"
   follower_cmd="go run main.go -id $id -http :$http_port -raft 127.0.0.1:$raft_port -data $DATA_DIR -join 127.0.0.1:8080 -console-level info -file-level debug -logs $LOG_DIR"
   tmux send-keys -t "$SESSION_NAME:0.$i" "echo -e \"${CYAN}Starting follower node: $id${NC}\"" C-m
   tmux send-keys -t "$SESSION_NAME:0.$i" "$follower_cmd" C-m
+  
   sleep "$DELAY_BETWEEN_NODES"
+  
+  # Verify the node joined successfully
+  echo "Checking if node $id joined the cluster..."
+  joined=0
+  for j in $(seq 1 5); do
+    status=$(curl -s http://localhost:$http_port/cluster/status 2>/dev/null)
+    if [ $? -eq 0 ] && [ -n "$status" ]; then
+      echo "Node $id is responding."
+      joined=1
+      break
+    fi
+    echo "Node $id not ready yet, waiting..."
+    sleep 2
+  done
+  
+  if [ $joined -eq 0 ]; then
+    echo -e "${YELLOW}Warning: Node $id may not have joined properly.${NC}"
+  fi
 done
 
+# Verify cluster formation
+echo "Checking final cluster status..."
+curl -s http://localhost:8080/cluster/status | grep -o '"leader"' || echo "Leader information not found"
+
 tmux send-keys -t "$SESSION_NAME:0.4" "echo -e \"${CYAN}Raft3D Test Commands:${NC}\"" C-m
-tmux send-keys -t "$SESSION_NAME:0.4" "echo -e \"${YELLOW}1. Check cluster status:${NC} curl http://localhost:8080/cluster/status\"" C-m
+tmux send-keys -t "$SESSION_NAME:0.4" "echo -e \"${YELLOW}1. Check cluster status:${NC} curl http://localhost:8080/cluster/status | jq\"" C-m
 tmux send-keys -t "$SESSION_NAME:0.4" "echo -e \"${YELLOW}2. Add a printer:${NC} curl -X POST -H \\\"Content-Type: application/json\\\" -d '{\\\"id\\\":\\\"printer1\\\",\\\"company\\\":\\\"Prusa\\\",\\\"model\\\":\\\"MK3S+\\\"}' http://localhost:8080/api/v1/printers\"" C-m
-tmux send-keys -t "$SESSION_NAME:0.4" "echo -e \"${YELLOW}3. Get all printers:${NC} curl http://localhost:8080/api/v1/printers\"" C-m
+tmux send-keys -t "$SESSION_NAME:0.4" "echo -e \"${YELLOW}3. Get all printers:${NC} curl http://localhost:8080/api/v1/printers | jq\"" C-m
 tmux send-keys -t "$SESSION_NAME:0.4" "echo -e \"${YELLOW}4. Add a filament:${NC} curl -X POST -H \\\"Content-Type: application/json\\\" -d '{\\\"id\\\":\\\"filament1\\\",\\\"type\\\":\\\"PLA\\\",\\\"color\\\":\\\"Red\\\",\\\"total_weight_in_grams\\\":1000,\\\"remaining_weight_in_grams\\\":1000}' http://localhost:8080/api/v1/filaments\"" C-m
 tmux send-keys -t "$SESSION_NAME:0.4" "echo -e \"${YELLOW}5. Add a print job:${NC} curl -X POST -H \\\"Content-Type: application/json\\\" -d '{\\\"id\\\":\\\"job1\\\",\\\"printer_id\\\":\\\"printer1\\\",\\\"filament_id\\\":\\\"filament1\\\",\\\"filepath\\\":\\\"/models/benchy.gcode\\\",\\\"print_weight_in_grams\\\":15}' http://localhost:8080/api/v1/print_jobs\"" C-m
 tmux send-keys -t "$SESSION_NAME:0.4" "echo -e \"${YELLOW}6. Update job status:${NC} curl -X POST \\\"http://localhost:8080/api/v1/print_jobs/job1/status?status=Running\\\"\"" C-m
 tmux send-keys -t "$SESSION_NAME:0.4" "echo -e \"${YELLOW}7. Manually remove a node:${NC} curl -X DELETE \\\"http://localhost:8080/cluster/servers?id=node3\\\"\"" C-m
 tmux send-keys -t "$SESSION_NAME:0.4" "echo -e \"${YELLOW}8. Kill a node (simulate failure):${NC} tmux send-keys -t \\\"$SESSION_NAME:0.2\\\" C-c\"" C-m
-tmux send-keys -t "$SESSION_NAME:0.4" "echo -e \"${YELLOW}9. Exit:${NC} tmux kill-session -t $SESSION_NAME\"" C-m
+tmux send-keys -t "$SESSION_NAME:0.4" "echo -e \"${YELLOW}9. Run test scenarios:${NC} ./test_scenarios.sh\"" C-m
+tmux send-keys -t "$SESSION_NAME:0.4" "echo -e \"${YELLOW}10. Exit:${NC} tmux kill-session -t $SESSION_NAME\"" C-m
 tmux send-keys -t "$SESSION_NAME:0.4" "echo" C-m
 tmux send-keys -t "$SESSION_NAME:0.4" "echo -e \"${CYAN}Ready to test commands. Type a command and press Enter:${NC}\"" C-m
 

@@ -103,6 +103,11 @@ func (f *PrinterFSM) applyAddPrintJob(data []byte) interface{} {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	// Set initial status to Queued if not set
+	if printJob.Status == "" {
+		printJob.Status = "Queued"
+	}
+
 	f.printJobs[printJob.ID] = printJob
 	return nil
 }

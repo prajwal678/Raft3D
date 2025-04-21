@@ -80,15 +80,22 @@ test_node_failure() {
   echo -e "\n${YELLOW}=== Running Node Failure Test ===${NC}"
   
   run_command "Initial cluster status" "curl -s $BASE_URL/cluster/status | jq -c ."
+  
+  # Add a test printer before killing the node
+  run_command "Adding a printer before node failure" "curl -s -X POST -H \"Content-Type: application/json\" -d '{\"id\":\"resilient-printer\",\"company\":\"Prusa\",\"model\":\"MK4\"}' $BASE_URL/api/v1/printers"
+  
   # killing node3
   echo -e "\n${YELLOW}Killing node3...${NC}"
   tmux send-keys -t "raft3d:0.2" C-c
   
   # wait to detect the failure
   echo -e "\n${YELLOW}Waiting for cluster to detect the failure...${NC}"
-  sleep 15
+  sleep 10
   
-  # status after failure
+  # Try to access node3 to demonstrate it's down
+  run_command "Attempting to access the killed node" "curl -s --connect-timeout 3 http://localhost:8082/cluster/status || echo 'Connection refused - Node is down'"
+  
+  # Check cluster status after node failure
   run_command "Cluster status after node failure" "curl -s $BASE_URL/cluster/status | jq -c ."
   
   # add a new printer to verify cluster still works
@@ -97,18 +104,18 @@ test_node_failure() {
   # get all printers to verify the operation succeeded
   run_command "Getting all printers after node failure" "curl -s $BASE_URL/api/v1/printers | jq -c ."
   
-  # restart the KILLED node lmao resurrection typa shii
+  # restart the node
   echo -e "\n${YELLOW}Restarting node3...${NC}"
   tmux send-keys -t "raft3d:0.2" "go run main.go -id node3 -http :8082 -raft 127.0.0.1:7002 -data ./data -join 127.0.0.1:8080 -console-level info -file-level debug -logs ./logs" C-m
   
   # wait for the node to rejoin
   echo -e "\n${YELLOW}Waiting for node to rejoin...${NC}"
-  sleep 10
+  sleep 20
   
-  # final cluster status
-  run_command "Final cluster status" "curl -s $BASE_URL/cluster/status | jq -c ."
+  # Check if node3 is back online and has the correct data
+  run_command "Verifying node3 is back online" "curl -s http://localhost:8082/cluster/status | jq -c ."
   
-  # verify the rejoined node has the data
+  # Verify all printers (including those added before and after node failure) are on the recovered node
   run_command "Verifying data on rejoined node" "curl -s http://localhost:8082/api/v1/printers | jq -c ."
   
   echo -e "\n${GREEN}Node failure and recovery test completed!${NC}"
@@ -117,9 +124,21 @@ test_node_failure() {
 test_leader_failure() {
   echo -e "\n${YELLOW}=== Running Leader Failure Test ===${NC}"
   
+  run_command "Initial cluster status" "curl -s $BASE_URL/cluster/status | jq -c ."
+  
+  # Add a test printer before killing the leader
+  run_command "Adding a printer before leader failure" "curl -s -X POST -H \"Content-Type: application/json\" -d '{\"id\":\"leader-test-printer\",\"company\":\"Prusa\",\"model\":\"MK4\"}' $BASE_URL/api/v1/printers"
+  
+  # Get initial leader info
   leader_response=$(curl -s $BASE_URL/cluster/status)
   is_leader=$(echo $leader_response | jq -r '.is_leader')
+  leader_id=$(echo $leader_response | jq -r '.leader')
   
+  echo -e "\n${CYAN}Current leader information:${NC}"
+  echo -e "Is leader: $is_leader"
+  echo -e "Leader address: $leader_id"
+  
+  # find and kill the leader(lmao)
   if [[ "$is_leader" == "true" ]]; then
     echo -e "\n${YELLOW}Current node is the leader. Killing it...${NC}"
     tmux send-keys -t "raft3d:0.0" C-c
@@ -127,7 +146,6 @@ test_leader_failure() {
     # need to change the base URL since we're killing the leader
     BASE_URL="http://localhost:8081"
   else
-    leader_id=$(echo $leader_response | jq -r '.leader')
     echo -e "\n${YELLOW}Current leader is $leader_id. Finding and killing it...${NC}"
     
     # find leader's pane and kill it
@@ -136,8 +154,9 @@ test_leader_failure() {
       is_leader=$(echo $pane_resp | jq -r '.is_leader' 2>/dev/null)
       
       if [[ "$is_leader" == "true" ]]; then
-        echo -e "${YELLOW}Leader found on pane 0.$i. Killing it...${NC}"
+        echo -e "${YELLOW}Leader found on node$((i+1)) (pane 0.$i). Killing it...${NC}"
         tmux send-keys -t "raft3d:0.$i" C-c
+        leader_found=1
         
         # update base URL to another node
         next_i=$(( (i + 1) % 4 ))
@@ -145,11 +164,45 @@ test_leader_failure() {
         break
       fi
     done
+    
+    if [[ "$leader_found" == "0" ]]; then
+      echo -e "${RED}Failed to find the leader node. Aborting test.${NC}"
+      return 1
+    fi
   fi
   
   # wait for a new leader to be elected
   echo -e "\n${YELLOW}Waiting for new leader election...${NC}"
-  sleep 15
+  elected=0
+  max_attempts=30
+  for ((i=1; i<=max_attempts; i++)); do
+    echo -e "${CYAN}Checking for new leader (attempt $i/$max_attempts)...${NC}"
+    sleep 2
+    
+    # Try all remaining nodes to find the new leader
+    for port in 8080 8081 8082 8083; do
+      resp=$(curl -s --connect-timeout 1 http://localhost:$port/cluster/status 2>/dev/null)
+      if [[ $? -eq 0 ]]; then  # If curl succeeded
+        is_leader=$(echo $resp | jq -r '.is_leader' 2>/dev/null)
+        if [[ "$is_leader" == "true" ]]; then
+          echo -e "${GREEN}New leader elected on port $port!${NC}"
+          BASE_URL="http://localhost:$port"
+          elected=1
+          break 2  # Break both loops
+        fi
+      fi
+    done
+  done
+  
+  if [[ "$elected" == "0" ]]; then
+    echo -e "${RED}No new leader was elected after $max_attempts attempts.${NC}"
+    echo -e "${YELLOW}Checking status of all nodes:${NC}"
+    for port in 8080 8081 8082 8083; do
+      echo -e "${CYAN}Node on port $port:${NC}"
+      curl -s --connect-timeout 1 http://localhost:$port/cluster/status | jq -c . 2>/dev/null || echo "Node unreachable"
+    done
+    return 1
+  fi
   
   # new cluster status
   run_command "Cluster status after leader failure" "curl -s $BASE_URL/cluster/status | jq -c ."
@@ -159,6 +212,13 @@ test_leader_failure() {
   
   # get all printers to verify the operation succeeded
   run_command "Getting all printers after leader failure" "curl -s $BASE_URL/api/v1/printers | jq -c ."
+  
+  # Check all nodes to verify replication
+  echo -e "\n${YELLOW}Checking replication across all nodes:${NC}"
+  for port in 8080 8081 8082 8083; do
+    echo -e "${CYAN}Node on port $port:${NC}"
+    curl -s --connect-timeout 1 http://localhost:$port/api/v1/printers | jq -c . 2>/dev/null || echo "Node unreachable"
+  done
   
   echo -e "\n${GREEN}Leader failure and election test completed!${NC}"
 }

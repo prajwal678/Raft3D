@@ -106,20 +106,20 @@ This script:
 The resulting tmux session will look like:
 
 ```
-initial config
-+----------------+----------------+
-| Node 1         |                |
-| (Bootstrap)    |                |
-+----------------+                |
-| Node 2         |                |
-| (Follower)     |   curl cmds    |
-+----------------+ (your window)  |
-| Node 3         | (to run cmds)  |
-| (Follower)     |                |
-+----------------+                |
-| Node 4         |                |
-| (Follower)     |                |
-+---------------------------------+
+initial config. monitor nodes on the left and run stuff on the right
++-----------------+-------------------------------+
+| Node 1          |                               |
+| (Bootstrap)     |                               |
++-----------------+                               |
+| Node 2          |                               |
+| (Follower)      |           test cmds           |
++-----------------+         (your window)         |
+| Node 3          |         (to run cmds)         |
+| (Follower)      |    run ./test_scenarios.sh    |
++-----------------+                               |
+| Node 4          |                               |
+| (Follower)      |                               |
++-----------------+-------------------------------+
 ```
 
 #### 3. Run automated test scenarios
