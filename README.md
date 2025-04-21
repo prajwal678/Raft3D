@@ -106,16 +106,20 @@ This script:
 The resulting tmux session will look like:
 
 ```
+initial config
 +----------------+----------------+
-| Node 1         | Node 2         |
-| (Bootstrap)    | (Follower)     |
-+----------------+----------------+
-| Node 3         | Node 4         |
-| (Follower)     | (Follower)     |
-+----------------+----------------+
-| Commands                        |
-| curl http://localhost:8080/...  |
-+-------------------------------+
+| Node 1         |                |
+| (Bootstrap)    |                |
++----------------+                |
+| Node 2         |                |
+| (Follower)     |   curl cmds    |
++----------------+ (your window)  |
+| Node 3         | (to run cmds)  |
+| (Follower)     |                |
++----------------+                |
+| Node 4         |                |
+| (Follower)     |                |
++---------------------------------+
 ```
 
 #### 3. Run automated test scenarios

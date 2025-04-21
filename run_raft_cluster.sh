@@ -23,6 +23,7 @@ if ! command -v tmux &> /dev/null; then
     echo "For macOS: brew install tmux"
     exit 1
 fi
+# not adding for arch cuz they should know, if not shouldn't be using arch
 
 tmux kill-session -t "$SESSION_NAME" 2>/dev/null
 

@@ -201,7 +201,33 @@ func (n *RaftNode) AddServer(nodeID, raftAddr string) error {
 }
 
 func (n *RaftNode) GetLeader() string {
-	return string(n.raft.Leader())
+	leaderAddr := string(n.raft.Leader())
+
+	// If we have a valid leader, return it
+	if leaderAddr != "" && leaderAddr != "@" {
+		return leaderAddr
+	}
+
+	// If no leader is known, check all servers in the configuration
+	// This helps during leader transitions
+	configFuture := n.raft.GetConfiguration()
+	if err := configFuture.Error(); err != nil {
+		log.Printf("error getting raft configuration: %v", err)
+		return ""
+	}
+
+	for _, server := range configFuture.Configuration().Servers {
+		if server.ID != raft.ServerID(n.nodeID) { // Don't return ourselves
+			serverAddr := string(server.Address)
+			if serverAddr != "" {
+				// Return the first other server we find
+				// The redirect process will eventually find the leader
+				return serverAddr
+			}
+		}
+	}
+
+	return ""
 }
 
 func (n *RaftNode) IsLeader() bool {

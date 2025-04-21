@@ -5,8 +5,8 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-DATA_DIR="./data"
-LOGS_DIR="./logs"
+DATA_DIR="./data/"
+LOGS_DIR="./logs/"
 
 clean_data_directory() {
     local dir=$1
@@ -40,8 +40,8 @@ if tmux has-session -t "raft3d" 2>/dev/null; then
     sleep 1
 fi
 
-clean_data_directory "$DATA_DIR"
-clean_data_directory "$LOGS_DIR"
+clean_data_directory $DATA_DIR
+clean_data_directory $LOGS_DIR
 
 sync
 

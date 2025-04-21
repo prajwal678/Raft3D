@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -164,6 +165,45 @@ func main() {
 				joined = true
 				logger.Info("successfully joined the cluster")
 				break
+			}
+
+			// Handle redirection to new leader
+			if resp.StatusCode == http.StatusTemporaryRedirect {
+				var redirect map[string]string
+				if err := json.Unmarshal(body, &redirect); err == nil {
+					if newLeader := redirect["leader"]; newLeader != "" {
+						// Construct new join address using the new leader's Raft address
+						// Extract the host from the Raft address
+						leaderParts := strings.Split(newLeader, ":")
+						if len(leaderParts) > 0 {
+							host := strings.Split(leaderParts[0], "@")[0]
+
+							// If host is empty, use localhost
+							if host == "" {
+								host = "127.0.0.1"
+							}
+
+							// Use the HTTP port corresponding to the node
+							// This assumes HTTP ports follow the same pattern as Raft ports
+							// E.g., if Raft is 7000, 7001, 7002, then HTTP is 8080, 8081, 8082
+							raftPort, err := strconv.Atoi(leaderParts[1])
+							if err == nil {
+								// Translate 7000->8080, 7001->8081, etc.
+								portDiff := 1080
+								httpPort := raftPort + portDiff
+								newJoinAddr := fmt.Sprintf("http://%s:%d", host, httpPort)
+
+								logger.Info("redirecting join request to new leader at %s", newJoinAddr)
+								joinAddr = newJoinAddr
+
+								// Don't count this as a retry
+								i--
+								time.Sleep(retryInterval)
+								continue
+							}
+						}
+					}
+				}
 			}
 
 			logger.Warn("failed to join cluster, retrying (%d/%d): status=%d, body=%s",

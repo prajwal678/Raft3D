@@ -3,7 +3,6 @@ module raft3d
 go 1.21.6
 
 require (
-	github.com/gorilla/mux v1.8.1
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb v0.0.0-20250225060035-8f7048cdfa53
 )
