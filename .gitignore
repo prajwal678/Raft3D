@@ -5,6 +5,8 @@
 *.so
 *.dylib
 
+design.md
+
 /data
 /logs
 /test_data

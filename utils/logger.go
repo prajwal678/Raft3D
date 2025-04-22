@@ -49,7 +49,7 @@ func NewLogger(nodeID, logDir string, consoleLevel, fileLevel LogLevel) (*Logger
 	}, nil
 }
 
-func (l *Logger) log(level LogLevel, prefix string, format string, args ...interface{}) {
+func (l *Logger) log(level LogLevel, prefix string, format string, args []interface{}, isEssential bool) {
 	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 	message := fmt.Sprintf(format, args...)
 	logLine := fmt.Sprintf("[%s] [%s] [%s] %s\n", timestamp, l.nodeID, prefix, message)
@@ -60,33 +60,55 @@ func (l *Logger) log(level LogLevel, prefix string, format string, args ...inter
 	}
 
 	if level >= l.consoleLevel {
-		switch level {
-		case LevelDebug:
-			fmt.Printf("\033[1;34m%s\033[0m", logLine) // blue
-		case LevelInfo:
-			fmt.Printf("\033[1;32m%s\033[0m", logLine) // green
-		case LevelWarning:
-			fmt.Printf("\033[1;33m%s\033[0m", logLine) // yellow
-		case LevelError:
-			fmt.Printf("\033[1;31m%s\033[0m", logLine) // red
+		if isEssential {
+			// Essential messages are always green for emphasis
+			fmt.Printf("\033[1;32m%s\033[0m", logLine) // bright green
+		} else {
+			switch level {
+			case LevelDebug:
+				fmt.Printf("\033[0;34m%s\033[0m", logLine) // dim blue
+			case LevelInfo:
+				fmt.Printf("%s", logLine) // normal white
+			case LevelWarning:
+				fmt.Printf("\033[1;33m%s\033[0m", logLine) // bright yellow
+			case LevelError:
+				fmt.Printf("\033[1;31m%s\033[0m", logLine) // bright red
+			}
 		}
 	}
 }
 
 func (l *Logger) Debug(format string, args ...interface{}) {
-	l.log(LevelDebug, "DEBUG", format, args...)
+	l.log(LevelDebug, "DEBUG", format, args, false)
 }
 
 func (l *Logger) Info(format string, args ...interface{}) {
-	l.log(LevelInfo, "INFO", format, args...)
+	l.log(LevelInfo, "INFO", format, args, false)
 }
 
 func (l *Logger) Warn(format string, args ...interface{}) {
-	l.log(LevelWarning, "WARN", format, args...)
+	l.log(LevelWarning, "WARN", format, args, false)
 }
 
 func (l *Logger) Error(format string, args ...interface{}) {
-	l.log(LevelError, "ERROR", format, args...)
+	l.log(LevelError, "ERROR", format, args, false)
+}
+
+// Essential methods - these log with green highlighting for important messages
+func (l *Logger) DebugEssential(format string, args ...interface{}) {
+	l.log(LevelDebug, "DEBUG", format, args, true)
+}
+
+func (l *Logger) InfoEssential(format string, args ...interface{}) {
+	l.log(LevelInfo, "INFO", format, args, true)
+}
+
+func (l *Logger) WarnEssential(format string, args ...interface{}) {
+	l.log(LevelWarning, "WARN", format, args, true)
+}
+
+func (l *Logger) ErrorEssential(format string, args ...interface{}) {
+	l.log(LevelError, "ERROR", format, args, true)
 }
 
 func (l *Logger) Close() error {

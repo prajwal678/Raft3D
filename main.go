@@ -81,13 +81,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger.Info("starting raft3d node: id=%s, http=%s, raft=%s", *nodeID, *httpAddr, *raftAddr)
+	logger.InfoEssential("starting raft3d node: id=%s, http=%s, raft=%s", *nodeID, *httpAddr, *raftAddr)
 
 	// Clean data directory if requested
 	if *clean {
 		nodeDataDir := filepath.Join(*dataDir, *nodeID)
 		if err := CleanDataDir(nodeDataDir); err != nil {
-			logger.Error("failed to clean data directory: %v", err)
+			logger.ErrorEssential("failed to clean data directory: %v", err)
 			os.Exit(1)
 		}
 	}
@@ -95,7 +95,7 @@ func main() {
 	// Create the data directory
 	nodeDataDir := filepath.Join(*dataDir, *nodeID)
 	if err := os.MkdirAll(nodeDataDir, 0755); err != nil {
-		logger.Error("failed to create data directory: %v", err)
+		logger.ErrorEssential("failed to create data directory: %v", err)
 		os.Exit(1)
 	}
 
@@ -109,7 +109,7 @@ func main() {
 	logger.Info("creating raft node with data directory: %s", nodeDataDir)
 	raftNode, err := raftnode.NewRaftNode(*nodeID, *raftAddr, nodeDataDir, *bootstrap, *join)
 	if err != nil {
-		logger.Error("failed to create raft node: %v", err)
+		logger.ErrorEssential("failed to create raft node: %v", err)
 		os.Exit(1)
 	}
 
@@ -119,7 +119,7 @@ func main() {
 	// Join the cluster if needed
 	if len(joinAddrs) > 0 && !*bootstrap {
 		// Join existing cluster by contacting the join address
-		logger.Info("joining cluster from %s", joinAddrs[0])
+		logger.InfoEssential("joining cluster from %s", joinAddrs[0])
 
 		joinAddr := joinAddrs[0]
 		// If the join address doesn't have a port, add the default HTTP port
@@ -140,7 +140,7 @@ func main() {
 
 		reqBody, err := json.Marshal(joinReq)
 		if err != nil {
-			logger.Error("failed to marshal join request: %v", err)
+			logger.ErrorEssential("failed to marshal join request: %v", err)
 			os.Exit(1)
 		}
 
@@ -163,7 +163,7 @@ func main() {
 
 			if resp.StatusCode == http.StatusOK {
 				joined = true
-				logger.Info("successfully joined the cluster")
+				logger.InfoEssential("successfully joined the cluster")
 				break
 			}
 
@@ -212,7 +212,7 @@ func main() {
 		}
 
 		if !joined {
-			logger.Error("failed to join the cluster after %d attempts", maxRetries)
+			logger.ErrorEssential("failed to join the cluster after %d attempts", maxRetries)
 			os.Exit(1)
 		}
 	}
@@ -420,7 +420,7 @@ func main() {
 	}()
 
 	// Start the HTTP server
-	logger.Info("raft3d node %s running http server on %s and raft on %s",
+	logger.InfoEssential("raft3d node %s running http server on %s and raft on %s",
 		*nodeID, *httpAddr, *raftAddr)
 
 	// Create server with timeout settings
@@ -432,7 +432,7 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	logger.Error("server error: %v", server.ListenAndServe())
+	logger.ErrorEssential("server error: %v", server.ListenAndServe())
 }
 
 // parseLogLevel converts a string log level to the corresponding LogLevel

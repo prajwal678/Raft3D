@@ -151,7 +151,7 @@ func NewRaftNode(nodeID, raftAddr, dataDir string, bootstrap bool, joinAddr stri
 
 	// Bootstrap the cluster if needed
 	if bootstrap {
-		rn.logger.Info("bootstrapping cluster with node: %s", nodeID)
+		rn.logger.InfoEssential("bootstrapping cluster with node: %s", nodeID)
 		configuration := raft.Configuration{
 			Servers: []raft.Server{
 				{
@@ -164,7 +164,7 @@ func NewRaftNode(nodeID, raftAddr, dataDir string, bootstrap bool, joinAddr stri
 		rn.raft.BootstrapCluster(configuration)
 	} else if joinAddr != "" {
 		// Join an existing cluster
-		rn.logger.Info("joining existing cluster at %s", joinAddr)
+		rn.logger.InfoEssential("joining existing cluster at %s", joinAddr)
 		err = rn.joinCluster(joinAddr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to join cluster: %w", err)
@@ -578,11 +578,11 @@ func (n *RaftNode) handleFailedServer(serverID string) {
 
 	// If we've reached the threshold, remove the server
 	if failures >= n.failureThreshold {
-		n.logger.Warn("server %s has been unresponsive for too long, removing from configuration", serverID)
+		n.logger.WarnEssential("server %s has been unresponsive for too long, removing from configuration", serverID)
 		if err := n.RemoveServer(serverID); err != nil {
-			n.logger.Error("error removing server %s: %v", serverID, err)
+			n.logger.ErrorEssential("error removing server %s: %v", serverID, err)
 		} else {
-			n.logger.Info("successfully removed server %s from the cluster", serverID)
+			n.logger.InfoEssential("successfully removed server %s from the cluster", serverID)
 		}
 	}
 }
@@ -598,7 +598,7 @@ func (n *RaftNode) monitorLeadership() {
 
 		// If leader has changed, log it
 		if leaderAddr != observedLeader {
-			n.logger.Info("leader changed from '%s' to '%s'", observedLeader, leaderAddr)
+			n.logger.InfoEssential("leader changed from '%s' to '%s'", observedLeader, leaderAddr)
 			n.previousLeader = observedLeader
 			observedLeader = leaderAddr
 
@@ -623,7 +623,7 @@ func (n *RaftNode) monitorLeadership() {
 				// Check if this node is eligible to be a candidate
 				state := n.raft.State()
 				if state != raft.Leader && state != raft.Candidate {
-					n.logger.Info("no leader detected for too long, checking server health")
+					n.logger.InfoEssential("no leader detected for too long, checking server health")
 
 					// Get configuration to see server list
 					future := n.raft.GetConfiguration()
@@ -631,7 +631,7 @@ func (n *RaftNode) monitorLeadership() {
 						// Request a leader check which might trigger an election
 						future := n.raft.VerifyLeader()
 						if err := future.Error(); err != nil {
-							n.logger.Warn("leader verification failed: %v", err)
+							n.logger.WarnEssential("leader verification failed: %v", err)
 						}
 					}
 				}
